@@ -189,95 +189,143 @@ async def index_files_to_db(lst_msg_id, chat, msg, bot):
 '''
 import logging
 import re
+from utils import temp
 from info import ADMINS
 from pyrogram import Client, filters, enums
-from pyrogram.errors import ChannelInvalid, UsernameInvalid, UsernameNotModified
+from pyrogram.errors import FloodWait, ChannelInvalid, ChatAdminRequired, UsernameInvalid, UsernameNotModified
+from info import INDEX_REQ_CHANNEL as LOG_CHANNEL
 from database.ia_filterdb import save_file
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+lock = asyncio.Lock()
 
 @Client.on_message(filters.private & filters.command('index'))
-async def index_command(bot, message):
+async def send_for_index(bot, message):
+    """Handles the /index command and validates the channel details."""
+    vj = await bot.ask(
+        message.chat.id,
+        "Send me the last post link or forward the last message from the channel to index files.",
+        parse_mode=enums.ParseMode.MARKDOWN
+    )
+
     try:
-        # Prompt user for the last post link or forward
-        response = await bot.ask(
-            message.chat.id,
-            "Send me the last post link or forward a message from the channel you want to index.",
-            timeout=60  # Timeout after 60 seconds
-        )
-
-        # Extract chat ID and message ID
-        if response.forward_from_chat and response.forward_from_message_id:
-            chat_id = response.forward_from_chat.id
-            last_msg_id = response.forward_from_message_id
-        elif response.text:
-            match = re.match(
-                r"(https://)?(t\.me|telegram\.me|telegram\.dog)/(c/)?(\d+|[a-zA-Z_0-9]+)/(\d+)$", 
-                response.text
-            )
-            if match:
-                chat_id = int(f"-100{match.group(4)}") if match.group(4).isdigit() else match.group(4)
-                last_msg_id = int(match.group(5))
-            else:
-                await message.reply("Invalid link. Please try again.")
-                return
+        # Extract channel and message ID from forwarded message or link
+        if vj.forward_from_chat and vj.forward_from_message_id:
+            chat_id = vj.forward_from_chat.username or vj.forward_from_chat.id
+            last_msg_id = vj.forward_from_message_id
+        elif vj.text:
+            regex = re.compile(r"(https://)?(t\.me/|telegram\.me/|telegram\.dog/)(c/)?(\d+|[a-zA-Z_0-9]+)/(\d+)$")
+            match = regex.match(vj.text)
+            if not match:
+                return await vj.reply("Invalid link. Please try again.")
+            chat_id = match.group(4)
+            last_msg_id = int(match.group(5))
+            if chat_id.isnumeric():
+                chat_id = int(f"-100{chat_id}")
         else:
-            await message.reply("Failed to get chat and message ID. Please try again.")
-            return
+            return await vj.reply("Could not process the input. Please try again.")
 
-        # Check bot permissions in the chat
-        try:
-            await bot.get_chat(chat_id)
-        except ChannelInvalid:
-            await message.reply("This is a private channel. Ensure the bot is an admin there.")
-            return
-        except (UsernameInvalid, UsernameNotModified):
-            await message.reply("Invalid chat link provided.")
-            return
-
-        # Start indexing files
-        await index_files_to_db(chat_id, last_msg_id, bot)
-        await message.reply("Indexing complete. Files have been saved to the database.")
-
+        await bot.get_chat(chat_id)  # Verify access to the chat
+    except ChannelInvalid:
+        return await vj.reply("This is a private channel/group. Make me an admin to index files.")
+    except (UsernameInvalid, UsernameNotModified):
+        return await vj.reply("Invalid link specified.")
     except Exception as e:
-        logger.exception("Error in /index command")
-        await message.reply(f"An error occurred: {e}")
+        logger.exception(e)
+        return await vj.reply(f"Error: {e}")
 
-async def index_files_to_db(chat_id, last_msg_id, bot):
-    """Index files from the chat and save them to the database."""
+    # Confirm indexing
+    buttons = [
+        [
+            InlineKeyboardButton("Start Indexing", callback_data=f"index#accept#{chat_id}#{last_msg_id}#{message.from_user.id}")
+        ],
+        [
+            InlineKeyboardButton("Cancel", callback_data="close_data"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(buttons)
+    await message.reply(
+        f"Do you want to index this channel?\n\nChat ID/Username: `{chat_id}`\nLast Message ID: `{last_msg_id}`",
+        reply_markup=reply_markup
+    )
+
+
+@Client.on_callback_query(filters.regex(r'^index#accept#'))
+async def start_indexing(bot, query):
+    """Start the indexing process after user confirmation."""
+    _, _, chat_id, last_msg_id, user_id = query.data.split("#")
+
+    # Ensure no concurrent indexing
+    if lock.locked():
+        return await query.answer("Another indexing process is in progress. Please wait.", show_alert=True)
+
+    await query.answer("Starting indexing...", show_alert=True)
+
+    try:
+        chat_id = int(chat_id)
+    except ValueError:
+        pass
+
+    await index_files_to_db(int(last_msg_id), chat_id, bot)
+
+
+async def index_files_to_db(last_msg_id, chat_id, bot):
+    """Fetch messages from the chat and save media/files to the database."""
     total_files = 0
     duplicate = 0
     errors = 0
     unsupported = 0
 
-    try:
-        async for message in bot.iter_messages(chat_id, last_msg_id=last_msg_id, reverse=True):
-            if not message.media:
-                unsupported += 1
-                continue
+    async with lock:
+        try:
+            async for message in bot.iter_messages(chat_id, last_msg_id=last_msg_id, reverse=True):
+                if not message.media:
+                    unsupported += 1
+                    continue
 
-            # Extract media attributes
-            media = getattr(message, message.media.value, None)
-            if not media:
-                unsupported += 1
-                continue
+                # Extract media attributes
+                media = getattr(message, message.media.value, None)
+                if not media:
+                    unsupported += 1
+                    continue
 
-            media.file_type = message.media.value
-            media.caption = message.caption
-            saved, status = await save_file(media)
+                file_data = {
+                    "file_id": media.file_id,
+                    "file_type": message.media.value,
+                    "caption": message.caption or "",
+                    "chat_id": chat_id,
+                    "message_id": message.id
+                }
 
-            if saved:
-                total_files += 1
-            elif status == 0:
-                duplicate += 1
-            else:
-                errors += 1
+                saved, status = await save_file(file_data)
 
-    except Exception as e:
-        logger.exception(f"Error during indexing: {e}")
+                if saved:
+                    total_files += 1
+                elif status == 0:
+                    duplicate += 1
+                else:
+                    errors += 1
 
-    logger.info(
-        f"Indexing completed. Total files: {total_files}, Duplicates: {duplicate}, Unsupported: {unsupported}, Errors: {errors}"
-    )
+            logger.info(
+                f"Indexing completed. Total files: {total_files}, Duplicates: {duplicate}, Unsupported: {unsupported}, Errors: {errors}"
+            )
+        except Exception as e:
+            logger.exception(f"Error during indexing: {e}")
+
+
+@Client.on_message(filters.command('setskip') & filters.user(ADMINS))
+async def set_skip_number(bot, message):
+    """Set the number of messages to skip during indexing."""
+    if ' ' in message.text:
+        _, skip = message.text.split(" ")
+        try:
+            skip = int(skip)
+        except ValueError:
+            return await message.reply("Skip number must be an integer.")
+        temp.CURRENT = skip
+        await message.reply(f"Skip number set to {skip}.")
+    else:
+        await message.reply("Please provide a skip number.")
 
