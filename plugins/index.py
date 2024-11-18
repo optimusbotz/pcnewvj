@@ -189,108 +189,95 @@ async def index_files_to_db(lst_msg_id, chat, msg, bot):
 '''
 import logging
 import re
-import asyncio
-from utils import temp
 from info import ADMINS
 from pyrogram import Client, filters, enums
-from pyrogram.errors import FloodWait
-from pyrogram.errors.exceptions.bad_request_400 import ChannelInvalid, ChatAdminRequired, UsernameInvalid, UsernameNotModified
+from pyrogram.errors import ChannelInvalid, UsernameInvalid, UsernameNotModified
 from database.ia_filterdb import save_file
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-lock = asyncio.Lock()
 
-
-@Client.on_callback_query(filters.regex(r'^index'))
-async def index_files(bot, query):
-    """Handle callback queries for indexing files."""
-    if query.data.startswith('index_cancel'):
-        temp.CANCEL = True
-        return await query.answer("Cancelling Indexing")
-    
-    _, raju, chat, lst_msg_id, from_user = query.data.split("#")
-    
-    if raju == 'reject':
-        await bot.send_message(
-            int(from_user),
-            f'Your submission for indexing {chat} has been declined by our moderators.',
-            reply_to_message_id=int(lst_msg_id)
-        )
-        return
-
-    if lock.locked():
-        return await query.answer('Wait until the previous process completes.', show_alert=True)
-
-    await query.answer('Processing...⏳', show_alert=True)
-
+@Client.on_message(filters.private & filters.command('index'))
+async def index_command(bot, message):
     try:
-        chat = int(chat)
-    except ValueError:
-        pass  # Chat remains a username if not convertible to an integer.
+        # Prompt user for the last post link or forward
+        response = await bot.ask(
+            message.chat.id,
+            "Send me the last post link or forward a message from the channel you want to index.",
+            timeout=60  # Timeout after 60 seconds
+        )
 
-    await index_files_to_db(int(lst_msg_id), chat, bot)
+        # Extract chat ID and message ID
+        if response.forward_from_chat and response.forward_from_message_id:
+            chat_id = response.forward_from_chat.id
+            last_msg_id = response.forward_from_message_id
+        elif response.text:
+            match = re.match(
+                r"(https://)?(t\.me|telegram\.me|telegram\.dog)/(c/)?(\d+|[a-zA-Z_0-9]+)/(\d+)$", 
+                response.text
+            )
+            if match:
+                chat_id = int(f"-100{match.group(4)}") if match.group(4).isdigit() else match.group(4)
+                last_msg_id = int(match.group(5))
+            else:
+                await message.reply("Invalid link. Please try again.")
+                return
+        else:
+            await message.reply("Failed to get chat and message ID. Please try again.")
+            return
 
+        # Check bot permissions in the chat
+        try:
+            await bot.get_chat(chat_id)
+        except ChannelInvalid:
+            await message.reply("This is a private channel. Ensure the bot is an admin there.")
+            return
+        except (UsernameInvalid, UsernameNotModified):
+            await message.reply("Invalid chat link provided.")
+            return
 
-async def index_files_to_db(lst_msg_id, chat, bot):
-    """Index files from the given chat and save them to the database."""
+        # Start indexing files
+        await index_files_to_db(chat_id, last_msg_id, bot)
+        await message.reply("Indexing complete. Files have been saved to the database.")
+
+    except Exception as e:
+        logger.exception("Error in /index command")
+        await message.reply(f"An error occurred: {e}")
+
+async def index_files_to_db(chat_id, last_msg_id, bot):
+    """Index files from the chat and save them to the database."""
     total_files = 0
     duplicate = 0
     errors = 0
-    deleted = 0
-    no_media = 0
     unsupported = 0
-    
-    async with lock:
-        try:
-            temp.CANCEL = False
-            current = temp.CURRENT
-            async for message in bot.iter_messages(chat, lst_msg_id, temp.CURRENT):
-                if temp.CANCEL:
-                    logger.info(f"Indexing canceled. Total files: {total_files}, Duplicates: {duplicate}")
-                    break
 
-                current += 1
-                
-                # Skip empty or deleted messages
-                if message.empty:
-                    deleted += 1
-                    continue
-                if not message.media:
-                    no_media += 1
-                    continue
+    try:
+        async for message in bot.iter_messages(chat_id, last_msg_id=last_msg_id, reverse=True):
+            if not message.media:
+                unsupported += 1
+                continue
 
-                # Check if the message has supported media
-                if message.media not in [enums.MessageMediaType.VIDEO, enums.MessageMediaType.AUDIO, enums.MessageMediaType.DOCUMENT]:
-                    unsupported += 1
-                    continue
+            # Extract media attributes
+            media = getattr(message, message.media.value, None)
+            if not media:
+                unsupported += 1
+                continue
 
-                # Extract media attributes and save to database
-                media = getattr(message, message.media.value, None)
-                if not media:
-                    unsupported += 1
-                    continue
-                
-                media.file_type = message.media.value
-                media.caption = message.caption
-                saved, status = await save_file(media)
-                
-                if saved:
-                    total_files += 1
-                elif status == 0:
-                    duplicate += 1
-                elif status == 2:
-                    errors += 1
+            media.file_type = message.media.value
+            media.caption = message.caption
+            saved, status = await save_file(media)
 
-        except Exception as e:
-            logger.exception(f"Error during indexing: {e}")
-        finally:
-            logger.info(
-                f"Indexing completed.\n"
-                f"Total files saved: {total_files}\n"
-                f"Duplicate files skipped: {duplicate}\n"
-                f"Deleted messages skipped: {deleted}\n"
-                f"Non-media messages skipped: {no_media}\n"
-                f"Unsupported media skipped: {unsupported}\n"
-                f"Errors occurred: {errors}"
-            )
+            if saved:
+                total_files += 1
+            elif status == 0:
+                duplicate += 1
+            else:
+                errors += 1
+
+    except Exception as e:
+        logger.exception(f"Error during indexing: {e}")
+
+    logger.info(
+        f"Indexing completed. Total files: {total_files}, Duplicates: {duplicate}, Unsupported: {unsupported}, Errors: {errors}"
+    )
+
