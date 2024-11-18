@@ -189,7 +189,7 @@ async def index_files_to_db(lst_msg_id, chat, msg, bot):
 '''
 import asyncio
 import time
-
+import logging
 from pyrogram import Client, filters, enums
 from pyrogram.errors import FloodWait
 from pyrogram.errors.exceptions.bad_request_400 import ChannelInvalid, ChatAdminRequired, UsernameInvalid, UsernameNotModified
