@@ -1,4 +1,4 @@
-# Don't Remove Credit @VJ_Botz
+'''# Don't Remove Credit @VJ_Botz
 # Subscribe YouTube Channel For Amazing Bot @Tech_VJ
 # Ask Doubt on telegram @KingVJ01
 
@@ -186,3 +186,68 @@ async def index_files_to_db(lst_msg_id, chat, msg, bot):
             await msg.edit(f'Error: {e}')
         else:
             await msg.edit(f'Succesfully saved <code>{total_files}</code> to dataBase!\nDuplicate Files Skipped: <code>{duplicate}</code>\nDeleted Messages Skipped: <code>{deleted}</code>\nNon-Media messages skipped: <code>{no_media + unsupported}</code>(Unsupported Media - `{unsupported}` )\nErrors Occurred: <code>{errors}</code>')
+'''
+import asyncio
+import time
+
+from pyrogram import Client, filters, enums
+from pyrogram.errors import FloodWait
+from pyrogram.errors.exceptions.bad_request_400 import ChannelInvalid, ChatAdminRequired, UsernameInvalid, UsernameNotModified
+from info import INDEX_REQ_CHANNEL as LOG_CHANNEL
+from database.ia_filterdb import save_file
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+lock = asyncio.Lock()
+
+async def edit_message(message, new_content):
+    if message.text != new_content:
+        try:
+            await message.edit_text(new_content)
+            print(f"Message edited successfully: {new_content}")
+        except errors.exceptions.BadRequest as e:
+            if e.MESSAGE == "MESSAGE_NOT_MODIFIED":
+                print("Message content is already the same.")
+            else:
+                raise e  # Re-raise other Bad Request exceptions
+    else:
+        print("Message content unchanged, skipping edit.")
+
+@Client.on_callback_query(filters.regex(r'^index'))
+async def index_files(bot, query):
+    # ... (rest of the callback query handler)
+
+    await msg.edit(
+        "Starting Indexing",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton('Cancel', callback_data='index_cancel')]]
+        )
+    )
+
+    # ... (rest of the callback query handler)
+
+    async with lock:
+        try:
+            current = temp.CURRENT
+            temp.CANCEL = False
+            async for message in bot.iter_messages(chat, lst_msg_id, current):
+                if temp.CANCEL:
+                    await edit_message(msg, f"Successfully Cancelled!!\n\nSaved <code>{total_files}</code> files to dataBase!\nDuplicate Files Skipped: <code>{duplicate}</code>\nDeleted Messages Skipped: <code>{deleted}</code>\nNon-Media messages skipped: <code>{no_media + unsupported}</code>(Unsupported Media - `{unsupported}` )\nErrors Occurred: <code>{errors}</code>")
+                    break
+
+                current += 1
+
+                if current % 50 == 0:
+                    cancel_button = InlineKeyboardButton('Cancel', callback_data='index_cancel')
+                    reply_markup = InlineKeyboardMarkup([[cancel_button]])
+                    await edit_message(msg, f"Total messages fetched: <code>{current}</code>\nTotal messages saved: <code>{total_files}</code>\nDuplicate Files Skipped: <code>{duplicate}</code>\nDeleted Messages Skipped: <code>{deleted}</code>\nNon-Media messages skipped: <code>{no_media + unsupported}</code>(Unsupported Media - `{unsupported}` )\nErrors Occurred: <code>{errors}</code>", reply_markup=reply_markup)
+
+                # ... (rest of the message processing and file saving logic)
+        except Exception as e:
+            logger.exception(e)
+            await edit_message(msg, f'Error: {e}')
+        else:
+            await edit_message(msg, f'Succesfully saved <code>{total_files}</code> to dataBase!\nDuplicate Files Skipped: <code>{duplicate}</code>\nDeleted Messages Skipped: <code>{deleted}</code>\nNon-Media messages skipped: <code>{no_media + unsupported}</code>(Unsupported Media - `{unsupported}` )\nErrors Occurred: <code>{errors}</code>')
+
+# ... (rest 1  of the code)
